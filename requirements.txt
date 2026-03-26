@@ -7,4 +7,5 @@ matplotlib
 scikit-learn
 jupyter
 streamlit
+altair<5
 sqlalchemy

@@ -698,6 +698,44 @@ def show_image_compat(image_obj, **kwargs):
         st.image(image_obj, **kwargs)
 
 
+def _normalize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    for col in out.columns:
+        col_dtype = str(out[col].dtype)
+        if col_dtype.startswith("datetime"):
+            out[col] = pd.to_datetime(out[col], errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
+            out[col] = out[col].fillna("")
+        elif col_dtype.startswith("string") or col_dtype == "object":
+            out[col] = out[col].fillna("").astype(str)
+    return out
+
+
+def dataframe_compat(df: pd.DataFrame, **kwargs):
+    st.dataframe(_normalize_df_for_streamlit(df), **kwargs)
+
+
+def data_editor_compat(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
+    safe_df = _normalize_df_for_streamlit(df)
+    editor_fn = getattr(st, "data_editor", None)
+    if editor_fn is None:
+        editor_fn = getattr(st, "experimental_data_editor", None)
+
+    if editor_fn is None:
+        st.warning("Editable grid is unavailable in this Streamlit version; showing a read-only table.")
+        dataframe_compat(safe_df, use_container_width=kwargs.get("use_container_width", True), height=kwargs.get("height"))
+        return safe_df
+
+    try:
+        return editor_fn(safe_df, **kwargs)
+    except TypeError:
+        fallback = {
+            "key": kwargs.get("key"),
+            "use_container_width": kwargs.get("use_container_width", True),
+            "height": kwargs.get("height"),
+        }
+        return editor_fn(safe_df, **{k: v for k, v in fallback.items() if v is not None})
+
+
 def logout():
     st.session_state.auth_user_id = None
     st.session_state.auth_role = None
@@ -947,7 +985,7 @@ def render_user_prediction_page(current_user: User):
 
     if st.session_state.batch_results:
         batch_df = pd.DataFrame(st.session_state.batch_results)
-        st.dataframe(batch_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(batch_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download Batch Results CSV",
             data=batch_df.to_csv(index=False).encode("utf-8"),
@@ -994,7 +1032,7 @@ def render_user_prediction_page(current_user: User):
             for r in db_rows
         ]
         db_df = pd.DataFrame(db_data)
-        st.dataframe(db_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(db_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download History CSV",
             data=db_df.to_csv(index=False).encode("utf-8"),
@@ -1006,7 +1044,7 @@ def render_user_prediction_page(current_user: User):
         st.markdown("### Delete Records")
         delete_df = db_df[["id", "timestamp", "file_name", "predicted_class", "confidence"]].copy()
         delete_df.insert(0, "delete", False)
-        edited_user_df = st.data_editor(
+        edited_user_df = data_editor_compat(
             delete_df,
             hide_index=True,
             height=TABLE_HEIGHT_7_ROWS,
@@ -1136,7 +1174,7 @@ def render_admin_page(current_admin: User):
                 }
             )
         activity_df = pd.DataFrame(activity_rows).sort_values("times_used", ascending=False)
-        st.dataframe(activity_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(activity_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
     else:
         st.info("No activity yet.")
 
@@ -1157,7 +1195,7 @@ def render_admin_page(current_admin: User):
                 for u in users
             ]
         )
-        st.dataframe(users_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(users_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download Users CSV",
             data=users_df.to_csv(index=False).encode("utf-8"),
@@ -1314,7 +1352,7 @@ def render_admin_page(current_admin: User):
         ]
         
         st.markdown(f"**Showing {len(filtered_df)} of {len(pred_df)} records**")
-        st.dataframe(filtered_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(filtered_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="📥 Download Filtered CSV",
             data=filtered_df.to_csv(index=False).encode("utf-8"),
@@ -1325,7 +1363,7 @@ def render_admin_page(current_admin: User):
         st.markdown("### Delete Saved Record")
         admin_delete_df = filtered_df[["id", "patient_id", "patient_name", "user_email", "image_name", "predicted_class", "confidence", "created_at"]].copy()
         admin_delete_df.insert(0, "delete", False)
-        edited_admin_df = st.data_editor(
+        edited_admin_df = data_editor_compat(
             admin_delete_df,
             hide_index=True,
             height=TABLE_HEIGHT_7_ROWS,

@@ -1,11 +1,12 @@
 numpy
-pandas
+pandas<2.3
 pillow
 torch
 torchvision
 matplotlib
 scikit-learn
 jupyter
-streamlit
-altair<5
+streamlit>=1.33,<2
+altair>=4,<6
+pyarrow<16
 sqlalchemy

@@ -9,6 +9,12 @@ End-to-end brain MRI tumor classification project with:
 
 This project is intended for educational and research use only.
 
+## Live Demo
+
+Deployed Streamlit app:
+
+- https://braintumourprediction-5ntt4vba5gqhwwwxyywxqu.streamlit.app/
+
 ## Project Structure
 
 ```text
@@ -183,16 +189,19 @@ Ensure both are using the same deployed checkpoint (`best_brain_tumor_model.pth`
 
 Current project dependencies (from `requirements.txt`):
 
-- numpy
-- pandas
+- numpy==1.26.4
+- pandas==2.1.4
 - pillow
 - torch
 - torchvision
-- matplotlib
+- matplotlib==3.8.4
 - scikit-learn
 - jupyter
-- streamlit
+- streamlit==1.33.0
+- altair==4.2.2
+- pyarrow==14.0.2
 - sqlalchemy
+
 
 ## Disclaimer
 

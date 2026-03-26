@@ -681,11 +681,28 @@ def ensure_state():
         st.session_state.batch_image_bytes = {}
 
 
+def rerun_app():
+    if hasattr(st, "rerun"):
+        st.rerun()
+    else:
+        st.experimental_rerun()
+
+
+def show_image_compat(image_obj, **kwargs):
+    try:
+        st.image(image_obj, **kwargs)
+    except TypeError:
+        use_container_width = kwargs.pop("use_container_width", None)
+        if use_container_width:
+            kwargs["use_column_width"] = True
+        st.image(image_obj, **kwargs)
+
+
 def logout():
     st.session_state.auth_user_id = None
     st.session_state.auth_role = None
     st.session_state.auth_email = None
-    st.rerun()
+    rerun_app()
 
 
 def render_guide_and_examples():
@@ -714,7 +731,7 @@ def render_guide_and_examples():
         cols = st.columns(len(samples))
         for i, p in enumerate(samples):
             with cols[i]:
-                st.image(str(p), caption=p.name, use_container_width=True)
+                show_image_compat(str(p), caption=p.name, use_container_width=True)
 
 
 def render_login_signup():
@@ -746,7 +763,7 @@ def render_login_signup():
                 st.session_state.auth_role = user.role
                 st.session_state.auth_email = user.email
                 st.success("Login successful.")
-                st.rerun()
+                rerun_app()
 
     with signup_tab:
         st.subheader("Create Account")
@@ -798,7 +815,7 @@ def render_user_prediction_page(current_user: User):
         run_pred = st.button("Predict", type="primary", use_container_width=True)
         if uploaded_file is not None:
             preview = Image.open(uploaded_file).convert("RGB")
-            st.image(preview, caption="Uploaded MRI", use_container_width=True)
+            show_image_compat(preview, caption="Uploaded MRI", use_container_width=True)
 
     with right:
         st.subheader("Prediction Output")
@@ -829,11 +846,11 @@ def render_user_prediction_page(current_user: User):
                             overlay_img, heat_img = build_saliency_overlay(pil)
                             h1, h2, h3 = st.columns(3)
                             with h1:
-                                st.image(pil, caption="Original MRI", use_container_width=True)
+                                show_image_compat(pil, caption="Original MRI", use_container_width=True)
                             with h2:
-                                st.image(overlay_img, caption="Overlay explanation", use_container_width=True)
+                                show_image_compat(overlay_img, caption="Overlay explanation", use_container_width=True)
                             with h3:
-                                st.image(heat_img, caption="Saliency heatmap", use_container_width=True)
+                                show_image_compat(heat_img, caption="Saliency heatmap", use_container_width=True)
                         except Exception as hm_err:
                             st.info(f"Heatmap unavailable for this model output: {hm_err}")
 
@@ -954,11 +971,11 @@ def render_user_prediction_page(current_user: User):
                         overlay_img, heat_img = build_saliency_overlay(sel_img)
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            st.image(sel_img, caption=f"Original ({selected_key})", use_container_width=True)
+                            show_image_compat(sel_img, caption=f"Original ({selected_key})", use_container_width=True)
                         with c2:
-                            st.image(overlay_img, caption="Overlay explanation", use_container_width=True)
+                            show_image_compat(overlay_img, caption="Overlay explanation", use_container_width=True)
                         with c3:
-                            st.image(heat_img, caption="Saliency heatmap", use_container_width=True)
+                            show_image_compat(heat_img, caption="Saliency heatmap", use_container_width=True)
                     except Exception as hm_err:
                         st.info(f"Batch heatmap unavailable: {hm_err}")
 
@@ -1019,12 +1036,12 @@ def render_user_prediction_page(current_user: User):
                         if ok:
                             deleted_count += 1
                     st.success(f"Deleted {deleted_count} record(s).")
-                    st.rerun()
+                    rerun_app()
         with col_b:
             if st.button("Delete All My History", use_container_width=True):
                 deleted = delete_all_user_predictions(current_user.id)
                 st.success(f"Deleted {deleted} records.")
-                st.rerun()
+                rerun_app()
     else:
         st.info("No saved predictions yet.")
 
@@ -1168,7 +1185,7 @@ def render_admin_page(current_admin: User):
                     )
                     if ok:
                         st.success(msg)
-                        st.rerun()
+                        rerun_app()
                     else:
                         st.error(msg)
             with c2:
@@ -1179,7 +1196,7 @@ def render_admin_page(current_admin: User):
                     )
                     if ok:
                         st.success(msg)
-                        st.rerun()
+                        rerun_app()
                     else:
                         st.error(msg)
 
@@ -1195,7 +1212,7 @@ def render_admin_page(current_admin: User):
             if ok:
                 st.success(msg)
                 st.session_state.auth_email = admin_new_email.strip() if admin_new_email.strip() else current_admin.email
-                st.rerun()
+                rerun_app()
             else:
                 st.error(msg)
     else:
@@ -1282,7 +1299,7 @@ def render_admin_page(current_admin: User):
                 st.session_state.filter_email_search = ""
                 st.session_state.filter_patient_name = ""
                 st.session_state.filter_patient_id = ""
-                st.rerun()
+                rerun_app()
         
         # Apply filters
         filtered_df = pred_df[
@@ -1336,7 +1353,7 @@ def render_admin_page(current_admin: User):
                     if ok:
                         deleted_count += 1
                 st.success(f"Deleted {deleted_count} record(s).")
-                st.rerun()
+                rerun_app()
 
         st.markdown("### 🖼️ Image Storage Viewer")
         

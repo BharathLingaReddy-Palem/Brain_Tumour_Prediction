@@ -711,7 +711,12 @@ def _normalize_df_for_streamlit(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dataframe_compat(df: pd.DataFrame, **kwargs):
-    st.dataframe(_normalize_df_for_streamlit(df), **kwargs)
+    safe_df = _normalize_df_for_streamlit(df)
+    try:
+        st.dataframe(safe_df, **kwargs)
+    except Exception:
+        # Fallback avoids Arrow/pyarrow runtime failures on some cloud images.
+        st.table(safe_df)
 
 
 def data_editor_compat(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
@@ -727,13 +732,18 @@ def data_editor_compat(df: pd.DataFrame, **kwargs) -> pd.DataFrame:
 
     try:
         return editor_fn(safe_df, **kwargs)
-    except TypeError:
+    except Exception:
         fallback = {
             "key": kwargs.get("key"),
             "use_container_width": kwargs.get("use_container_width", True),
             "height": kwargs.get("height"),
         }
-        return editor_fn(safe_df, **{k: v for k, v in fallback.items() if v is not None})
+        try:
+            return editor_fn(safe_df, **{k: v for k, v in fallback.items() if v is not None})
+        except Exception:
+            st.warning("Editable grid failed in this cloud runtime; showing read-only table.")
+            dataframe_compat(safe_df, use_container_width=fallback["use_container_width"], height=fallback["height"])
+            return safe_df
 
 
 def logout():

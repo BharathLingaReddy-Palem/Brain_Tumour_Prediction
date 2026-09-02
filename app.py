@@ -23,6 +23,15 @@ import torch.nn as nn
 from PIL import Image
 from torchvision import models, transforms
 
+# ---------- Segmentation module (optional – graceful fallback if deps missing) ----------
+try:
+    from segmentation.graph_cut import GraphCutSegmenter
+    from segmentation.metrics import SegmentationMetrics
+    _SEG_AVAILABLE = True
+except ImportError as _seg_import_err:
+    _SEG_AVAILABLE = False
+    _SEG_IMPORT_ERR = str(_seg_import_err)
+
 
 # ---------- Page setup ----------
 st.set_page_config(
@@ -1473,6 +1482,263 @@ def render_admin_page(current_admin: User):
         st.info("No predictions found.")
 
 
+# ---------- Segmentation page ----------
+
+def _seg_unavailable_warning():
+    st.error(
+        "Segmentation module dependencies are not installed. "
+        "Run: `pip install scikit-image opencv-python scipy`"
+    )
+    if not _SEG_AVAILABLE:
+        st.code(_SEG_IMPORT_ERR, language="text")
+
+
+@st.cache_resource(show_spinner=False)
+def _load_graph_cut_segmenter():
+    """Cached GraphCutSegmenter – created once per session."""
+    return GraphCutSegmenter(method="normalized_cut", img_size=256)
+
+
+def render_segmentation_page(current_user: User):
+    st.markdown(
+        """
+        <div class="hero">
+          <h1>🧠 Brain Tumor Isolation via Graph Cut Segmentation</h1>
+          <p>Computer Vision Analysis: Graph Formulation, Skull-Stripping, and Energy Min-Cut / Normalized Cut Segmentation.</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if not _SEG_AVAILABLE:
+        _seg_unavailable_warning()
+        return
+
+    # ── Method Architecture Summary ──────────────────────────────────────────
+    st.markdown(
+        """
+        <div style='background: linear-gradient(135deg, #0f766e 0%, #134e4a 100%); 
+                    border-radius: 14px; padding: 1.2rem 1.4rem; margin-bottom: 1.5rem;'>
+            <h3 style='color:#f0f9ff; margin:0 0 0.5rem 0;'>⚡ Graph Cut Tumor Isolation Pipeline</h3>
+            <p style='color:#dff6f2; font-size:0.92rem; margin:0;'>
+              <strong>1. Skull Stripping:</strong> Intracranial parenchyma is extracted to eliminate skull and background artifacts.<br>
+              <strong>2. Graph Construction:</strong> Pixels & SLIC superpixels become nodes; edge weights model local intensity similarities.<br>
+              <strong>3. Cut Optimization:</strong> Min-Cut / Normalized Cut partitions healthy tissue from hyperintense lesion mass.<br>
+              <strong>4. Necrotic Core Reconstruction:</strong> Automatically fills non-enhancing necrotic cavities in high-grade ring tumors (GBM).
+            </p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # ── Upload & Configuration Section ────────────────────────────────────────
+    upload_col, options_col = st.columns([1.1, 0.9], gap="large")
+    with upload_col:
+        st.subheader("📤 Upload MRI Scan")
+        seg_file = st.file_uploader(
+            "Choose a Brain MRI Scan",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            key="seg_uploader",
+        )
+        gt_file = st.file_uploader(
+            "Ground Truth Mask (optional — for quantitative evaluation)",
+            type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            key="seg_gt_uploader",
+            help="Upload a ground-truth tumor mask if available to calculate Dice & IoU metrics.",
+        )
+        if seg_file is not None:
+            preview = Image.open(seg_file).convert("RGB")
+            show_image_compat(preview, caption="Uploaded MRI Scan", use_container_width=True)
+
+    with options_col:
+        st.subheader("⚙️ Graph Cut Controls")
+
+        gc_method_label = st.selectbox(
+            "Graph Cut Formulation",
+            [
+                "Seeded Min-Cut (Energy Minimization)",
+                "Normalized Cut (Superpixel RAG)",
+                "Adaptive Ensemble (Consensus Cut)",
+            ],
+            index=0,
+            key="gc_method_choice",
+            help="Seeded Min-Cut solves max-flow/min-cut on pixel graph. Normalized Cut spectral-partitions the superpixel RAG.",
+        )
+        method_map = {
+            "Seeded Min-Cut (Energy Minimization)": "grabcut",
+            "Normalized Cut (Superpixel RAG)": "normalized_cut",
+            "Adaptive Ensemble (Consensus Cut)": "both",
+        }
+        gc_method = method_map[gc_method_label]
+
+        region_label = st.selectbox(
+            "🎯 Anatomical Region Targeting",
+            [
+                "Auto-Detect (Whole Brain)",
+                "Right Hemisphere Focus",
+                "Left Hemisphere Focus",
+                "Center / Pituitary Region",
+            ],
+            index=0,
+            key="gc_region_choice",
+            help="Focuses the graph cut search window if tumor location is known, suppressing contralateral false positives.",
+        )
+        region_map = {
+            "Auto-Detect (Whole Brain)": "auto",
+            "Right Hemisphere Focus": "right_hemisphere",
+            "Left Hemisphere Focus": "left_hemisphere",
+            "Center / Pituitary Region": "center_pituitary",
+        }
+        region_filter = region_map[region_label]
+
+        sensitivity = st.slider(
+            "Tumor Contrast Sensitivity",
+            min_value=0.5,
+            max_value=2.0,
+            value=1.0,
+            step=0.1,
+            key="gc_sensitivity",
+            help="Lower (0.5x-0.8x) for intense focal tumors; Higher (1.2x-1.8x) for diffuse or lower-contrast infiltrations.",
+        )
+
+        fill_core = st.checkbox(
+            "Include Necrotic Core (Cavity Fill)",
+            value=True,
+            key="gc_fill_core",
+            help="Fills the central hypointense necrotic cavity found inside ring-enhancing tumors (like Glioblastoma Multiforme).",
+        )
+
+        gc_postprocess = st.checkbox("Morphological Cleanup & Boundary Smoothing", value=True, key="gc_postprocess")
+
+        run_btn = st.button("✂️ Run Graph Cut Segmentation", type="primary", use_container_width=True, key="seg_run_btn")
+
+    # ── Execution & Results ───────────────────────────────────────────────────
+    if run_btn:
+        if seg_file is None:
+            st.warning("Please upload an MRI image first.")
+            return
+
+        mri_bytes = seg_file.getvalue()
+        pil_img = Image.open(BytesIO(mri_bytes)).convert("RGB")
+        gt_mask_np = None
+
+        if gt_file is not None:
+            gt_pil = Image.open(gt_file.getvalue() if hasattr(gt_file, "getvalue") else gt_file).convert("L")
+            gt_arr = np.array(gt_pil.resize((256, 256), Image.NEAREST), dtype=np.float32)
+            gt_mask_np = (gt_arr > 127).astype(np.uint8)
+
+        with st.spinner("⚡ Running Graph Cut segmentation & boundary isolation…"):
+            try:
+                segmenter = GraphCutSegmenter(
+                    method=gc_method,
+                    img_size=256,
+                    sensitivity=sensitivity,
+                    fill_necrotic_core=fill_core,
+                    region_filter=region_filter,
+                )
+                gc_result = segmenter.segment(pil_img, postprocess=gc_postprocess)
+                gc_mask_np = gc_result["mask"]
+
+                gc_metrics = None
+                if gt_mask_np is not None:
+                    gc_metrics = SegmentationMetrics(
+                        pred_mask=gc_mask_np,
+                        true_mask=gt_mask_np,
+                        method=gc_method_label,
+                    )
+            except Exception as e:
+                st.error(f"Graph Cut segmentation error: {e}")
+                return
+
+        # ── Display Visual Results ────────────────────────────────────────────
+        st.markdown("---")
+        st.subheader("🖼️ Tumor Isolation Outputs")
+
+        has_roi = gc_result.get("roi_pil") is not None
+        num_cards = 5 if has_roi else 4
+        display_cols = st.columns(num_cards)
+
+        with display_cols[0]:
+            show_image_compat(pil_img, caption="1. Input MRI Scan", use_container_width=True)
+
+        with display_cols[1]:
+            show_image_compat(gc_result["contour_pil"], caption="2. Cyan Boundary Outline", use_container_width=True)
+
+        with display_cols[2]:
+            show_image_compat(gc_result["overlay"], caption="3. Red Tissue Highlight", use_container_width=True)
+
+        with display_cols[3]:
+            show_image_compat(gc_result["mask_pil"], caption="4. Binary Tumor Mask", use_container_width=True)
+
+        if has_roi:
+            with display_cols[4]:
+                show_image_compat(gc_result["roi_pil"], caption="5. Magnified Tumor ROI", use_container_width=True)
+
+        # ── Quantitative Tumor Measurements ───────────────────────────────────
+        st.markdown("---")
+        st.subheader("📐 Quantitative Tumor Measurements")
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("🔴 Tumor Area", f"{gc_result['tumor_pixels']:,} px")
+        m2.metric("🔬 Scan Coverage", f"{gc_result['tumor_pct']:.2f}%")
+        m3.metric("🧠 Brain Burden", f"{gc_result['brain_pct']:.2f}%")
+        m4.metric("📏 Est. Diameter", f"{gc_result['diameter_px']:.1f} px")
+        m5.metric("📍 Centroid (X,Y)", f"{gc_result['centroid'][0]}, {gc_result['centroid'][1]}")
+
+        # ── Evaluation Metrics (if ground truth uploaded) ─────────────────────
+        if gc_metrics is not None:
+            st.markdown("---")
+            st.subheader("📊 Accuracy Evaluation (vs Ground Truth)")
+            metrics_df = pd.DataFrame([gc_metrics.summary()])
+            dataframe_compat(metrics_df, use_container_width=True)
+
+            st.download_button(
+                label="📥 Download Evaluation Metrics CSV",
+                data=metrics_df.to_csv(index=False).encode("utf-8"),
+                file_name="graph_cut_metrics.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+        # ── Download Segmented Mask ───────────────────────────────────────────
+        buf = BytesIO()
+        gc_result["mask_pil"].save(buf, format="PNG")
+        st.download_button(
+            label="💾 Download Segmented Tumor Mask (PNG)",
+            data=buf.getvalue(),
+            file_name="segmented_tumor_mask.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+
+        # ── Method Documentation Expander ─────────────────────────────────────
+        st.markdown("---")
+        with st.expander("📖 Computer Vision Theory: Graph Cut Segmentation (PDF Topic)", expanded=False):
+            st.markdown(
+                """
+### 1. Mathematical Graph Formulation
+In Graph Cut image segmentation, the MRI scan is modeled as an undirected weighted graph:
+$$\\mathcal{G} = (\\mathcal{V}, \\mathcal{E})$$
+- **Nodes $\\mathcal{V}$:** Represent individual pixels or SLIC superpixels inside the intracranial cavity. Two specialized terminal nodes are established:
+  - **Source ($S$):** Tumor / lesion class
+  - **Sink ($T$):** Healthy brain parenchyma & non-brain background
+- **Edges $\\mathcal{E}$:** 
+  - **$n$-links (neighborhood links):** Connect adjacent pixels/superpixels with boundary weights $W_{p,q} \\propto \\exp(-\\beta \\|I_p - I_q\\|^2)$.
+  - **$t$-links (terminal links):** Connect nodes to $S$ and $T$, encoding the likelihood of a pixel belonging to tumor vs healthy brain tissue.
+
+### 2. Energy Minimization via Min-Cut / Max-Flow
+The Boykov-Kolmogorov algorithm finds the global minimum of the energy functional:
+$$E(L) = \\sum_{p \\in \\mathcal{V}} D_p(L_p) + \\sum_{(p,q) \\in \\mathcal{E}} V_{p,q}(L_p, L_q)$$
+By the **Ford-Fulkerson Max-Flow / Min-Cut Theorem**, finding the minimum cut energy corresponds to finding the bottleneck boundary isolating the tumor lesion from healthy brain tissue.
+
+### 3. Normalized Cut (Shi & Malik)
+In Normalized Cut, the criterion minimizes cut cost relative to total association:
+$$\\text{NCut}(A, B) = \\frac{\\text{cut}(A, B)}{\\text{assoc}(A, \\mathcal{V})} + \\frac{\\text{cut}(A, B)}{\\text{assoc}(B, \\mathcal{V})}$$
+Solved via the generalized eigensystem $(D - W)y = \\lambda D y$, producing spectral partitioning on superpixel Region Adjacency Graphs (RAG).
+                """
+            )
+
+
 def get_current_user():
     user_id = st.session_state.auth_user_id
     if user_id is None:
@@ -1545,9 +1811,15 @@ def main():
         else:
             render_guide_and_examples()
     else:
-        page = st.radio("Navigation", ["Predict", "Class Guide"], horizontal=True)
+        page = st.radio(
+            "Navigation",
+            ["Predict", "Segmentation", "Class Guide"],
+            horizontal=True,
+        )
         if page == "Predict":
             render_user_prediction_page(current_user)
+        elif page == "Segmentation":
+            render_segmentation_page(current_user)
         else:
             render_guide_and_examples()
 

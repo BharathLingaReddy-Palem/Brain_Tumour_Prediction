@@ -1,0 +1,21 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local database
+*.db
+brain_tumor_app.db
+
+# User uploads & temporary test artifacts
+uploaded_scans/
+debug_*.png
+test_*.png
+test_*.py
+
+# Environments & IDE
+.vscode/
+.idea/
+.venv/
+env/
+venv/

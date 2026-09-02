@@ -10,3 +10,11 @@ streamlit==1.33.0
 altair==4.2.2
 pyarrow==14.0.2
 sqlalchemy
+psycopg2-binary
+
+# --- Segmentation module dependencies ---
+scikit-image
+opencv-python
+scipy
+
+

@@ -15,6 +15,10 @@ This project is intended for educational and research use only.
 
 [GitHub repository](https://github.com/BharathLingaReddy-Palem/Brain_Tumour_Prediction) · deployment branch: `main` · entry point: `app.py` · Python: `3.11`.
 
+The repaired app was deployed and verified on 1 November 2026. A real upload to Community Cloud returned `glioma` with `96.95%` model confidence for the same public MRI sample used locally, and the SmoothGrad heatmap rendered successfully. [Deployment verification details](webtesting_folder/results/cloud_verification.json).
+
+![Verified live Community Cloud prediction](assets/report/cloud_prediction_current.jpg)
+
 ## Project Structure
 
 ```text
@@ -85,6 +89,10 @@ Captured from the repaired application on 1 November 2026, using a separate demo
 ### SmoothGrad visual explanation
 
 ![Original MRI, saliency overlay, and heatmap](assets/report/heatmap_current.jpg)
+
+The same explanation was also checked on the deployed app:
+
+![Verified live Community Cloud heatmap](assets/report/cloud_heatmap_current.jpg)
 
 ### Graph-cut segmentation
 

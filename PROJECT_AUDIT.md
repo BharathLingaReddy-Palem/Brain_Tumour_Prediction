@@ -105,4 +105,4 @@ $python = 'C:\Users\acer\anaconda3\envs\computer_vision\python.exe'
 & $python -m streamlit run app.py
 ```
 
-`DATABASE_URL` and `UPLOADS_DIR` can point at disposable test locations. A first-time administrator requires `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and optionally `ADMIN_NAME`. No public deployment was changed by this audit.
+`DATABASE_URL` and `UPLOADS_DIR` can point at disposable test locations. A first-time administrator requires `ADMIN_EMAIL`, `ADMIN_PASSWORD`, and optionally `ADMIN_NAME`. The initial audit preserved the public deployment. A subsequent publication update deployed the repaired application to the existing Streamlit Community Cloud URL; the README contains live verification screenshots and deployment details.

@@ -24,6 +24,8 @@ Current app screenshots captured on 1 November 2026:
 - segmentation_current.jpg
 - batch_current.jpg
 - admin_current.jpg
+- cloud_prediction_current.jpg (verified public deployment)
+- cloud_heatmap_current.jpg (verified public deployment)
 
 The README embeds these current screenshots. They use a disposable local
 demonstration database and public, publisher-labeled MRI samples. Historical

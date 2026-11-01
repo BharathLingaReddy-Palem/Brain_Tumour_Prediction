@@ -1,0 +1,23 @@
+{
+  "verified_date": "2026-11-01",
+  "timezone": "Asia/Calcutta",
+  "application_url": "https://braintumourprediction-5ntt4vba5gqhwwwxyywxqu.streamlit.app/",
+  "repository": "BharathLingaReddy-Palem/Brain_Tumour_Prediction",
+  "branch": "main",
+  "entrypoint": "app.py",
+  "application_code_commit": "fbb3bfd1f06ef80cf710159d0bee340dcecf7b86",
+  "cloud_python_version": "3.11",
+  "model_loaded": "Basic CNN",
+  "device": "cpu",
+  "sample": "hf_nickparvar_Te-gl_0013.jpg",
+  "sample_source_label": "glioma",
+  "live_prediction": "glioma",
+  "displayed_model_confidence_percent": 96.95,
+  "matches_local_prediction_and_displayed_confidence": true,
+  "live_heatmap_rendered": true,
+  "upload_limit_mb": 32,
+  "local_regression_tests_passed": 24,
+  "linux_python311_dependency_resolution": "passed",
+  "verification_scope": "Existing app updated in place; real public MRI upload and explanation checked through browser using a disposable test account.",
+  "limitation": "A single deployment smoke test does not establish diagnostic accuracy; the displayed confidence is uncalibrated."
+}

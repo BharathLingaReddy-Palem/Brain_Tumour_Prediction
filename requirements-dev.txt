@@ -1,0 +1,8 @@
+# Optional training, notebook, evaluation, and audit dependencies.
+# The preconfigured computer_vision environment already contains these tools.
+-r requirements.txt
+scikit-learn>=1.4,<2
+jupyter
+optuna>=4,<5
+requests>=2.32,<3
+pypdf

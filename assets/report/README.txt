@@ -16,3 +16,15 @@ Notes:
 - The LaTeX file ieee_report_step1.tex already references these paths.
 - If files are missing, placeholder boxes are shown during compile.
 - Recommended image width >= 1200 px for better print quality.
+
+Current app screenshots captured on 1 November 2026:
+- login_current.jpg
+- prediction_current.jpg
+- heatmap_current.jpg
+- segmentation_current.jpg
+- batch_current.jpg
+- admin_current.jpg
+
+The README embeds these current screenshots. They use a disposable local
+demonstration database and public, publisher-labeled MRI samples. Historical
+PNG report figures above are retained rather than relabeled as new results.

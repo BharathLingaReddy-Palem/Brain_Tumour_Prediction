@@ -27,7 +27,7 @@ from typing import Optional
 import numpy as np
 
 try:
-    from scipy.spatial.distance import directed_hausdorff
+    from scipy.ndimage import binary_erosion, distance_transform_edt
     _SCIPY_OK = True
 except ImportError:
     _SCIPY_OK = False
@@ -39,7 +39,16 @@ except ImportError:
 
 def _flatten_binary(mask: np.ndarray) -> np.ndarray:
     """Convert any mask to a flat bool array."""
-    return mask.astype(bool).ravel()
+    arr = np.asarray(mask)
+    if arr.ndim != 2 or arr.size == 0 or not np.isfinite(arr).all():
+        raise ValueError("Masks must be finite, non-empty 2D arrays.")
+    return arr.astype(bool).ravel()
+
+
+def _validate_pair(pred, true):
+    if np.shape(pred) != np.shape(true):
+        raise ValueError(f"Mask shapes must match: {np.shape(pred)} != {np.shape(true)}")
+    return _flatten_binary(pred), _flatten_binary(true)
 
 
 def dice_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float:
@@ -47,8 +56,7 @@ def dice_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> floa
     Dice Similarity Coefficient  =  2·|X∩Y| / (|X| + |Y|)
     Range [0, 1].  1 = perfect overlap.
     """
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     intersection = (p & t).sum()
     return float((2.0 * intersection + smooth) / (p.sum() + t.sum() + smooth))
 
@@ -58,8 +66,7 @@ def iou_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float
     Intersection over Union (Jaccard Index)  =  |X∩Y| / |X∪Y|
     Range [0, 1].  1 = perfect overlap.
     """
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     intersection = (p & t).sum()
     union = (p | t).sum()
     return float((intersection + smooth) / (union + smooth))
@@ -67,8 +74,7 @@ def iou_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float
 
 def precision_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float:
     """Precision = TP / (TP + FP)"""
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     tp = (p & t).sum()
     fp = (p & ~t).sum()
     return float((tp + smooth) / (tp + fp + smooth))
@@ -76,8 +82,7 @@ def precision_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) ->
 
 def recall_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float:
     """Recall / Sensitivity = TP / (TP + FN)"""
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     tp = (p & t).sum()
     fn = (~p & t).sum()
     return float((tp + smooth) / (tp + fn + smooth))
@@ -85,8 +90,7 @@ def recall_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> fl
 
 def specificity_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) -> float:
     """Specificity = TN / (TN + FP)"""
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     tn = (~p & ~t).sum()
     fp = (p & ~t).sum()
     return float((tn + smooth) / (tn + fp + smooth))
@@ -94,8 +98,7 @@ def specificity_score(pred: np.ndarray, true: np.ndarray, smooth: float = 1e-6) 
 
 def pixel_accuracy(pred: np.ndarray, true: np.ndarray) -> float:
     """Pixel Accuracy = (TP + TN) / total pixels"""
-    p = _flatten_binary(pred)
-    t = _flatten_binary(true)
+    p, t = _validate_pair(pred, true)
     correct = (p == t).sum()
     return float(correct / len(p))
 
@@ -105,14 +108,17 @@ def hausdorff_distance(pred: np.ndarray, true: np.ndarray) -> Optional[float]:
     Hausdorff Distance between the boundary of pred and true masks.
     Returns None if scipy is not available or masks are empty.
     """
+    _validate_pair(pred, true)
     if not _SCIPY_OK:
         return None
-    p_pts = np.argwhere(_flatten_binary(pred).reshape(pred.shape))
-    t_pts = np.argwhere(_flatten_binary(true).reshape(true.shape))
-    if len(p_pts) == 0 or len(t_pts) == 0:
+    p = _flatten_binary(pred).reshape(pred.shape)
+    t = _flatten_binary(true).reshape(true.shape)
+    if not p.any() or not t.any():
         return None
-    d1 = directed_hausdorff(p_pts, t_pts)[0]
-    d2 = directed_hausdorff(t_pts, p_pts)[0]
+    p_boundary = p & ~binary_erosion(p, border_value=0)
+    t_boundary = t & ~binary_erosion(t, border_value=0)
+    d1 = distance_transform_edt(~t_boundary)[p_boundary].max()
+    d2 = distance_transform_edt(~p_boundary)[t_boundary].max()
     return float(max(d1, d2))
 
 
@@ -148,6 +154,9 @@ class SegmentationMetrics:
     tumor_pixel_pct : float       = field(default=0.0,  init=False)
 
     def __post_init__(self):
+        _flatten_binary(self.pred_mask)
+        if self.true_mask is not None:
+            _validate_pair(self.pred_mask, self.true_mask)
         self.tumor_pixel_pct = float(self.pred_mask.astype(bool).mean() * 100.0)
 
         if self.true_mask is not None:

@@ -12,16 +12,18 @@ import re
 import secrets
 import zipfile
 
-import matplotlib.cm as cm
+import matplotlib
 import numpy as np
 import pandas as pd
 from sqlalchemy import Column, DateTime, Float, ForeignKey, Integer, String, Text, create_engine, inspect, text
 from sqlalchemy.orm import declarative_base, relationship, sessionmaker
+from sqlalchemy.pool import NullPool
 import streamlit as st
 import torch
-import torch.nn as nn
 from PIL import Image
-from torchvision import models, transforms
+from inference import (BasicCNN, build_basic_cnn, build_resnet50_transfer,
+                       build_efficientnet_b0_transfer, load_inference_artifacts)
+from image_io import decode_image
 
 # ---------- Segmentation module (optional – graceful fallback if deps missing) ----------
 try:
@@ -86,7 +88,7 @@ MODEL_PATH = ARTIFACTS_DIR / "best_brain_tumor_model.pth"
 CLASS_MAP_PATH = ARTIFACTS_DIR / "class_mapping.json"
 DEFAULT_DATASET_TEST = ROOT / "Dataset" / "Testing"
 EXAMPLE_ROOT = ROOT / "assets" / "examples"
-UPLOADS_DIR = ROOT / "uploaded_scans"
+UPLOADS_DIR = Path(os.getenv("UPLOADS_DIR", str(ROOT / "uploaded_scans")))
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 
 ALLOWED_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -118,11 +120,11 @@ CLASS_INFO = {
         ],
     },
     "notumor": {
-        "title": "No Tumor (Normal)",
+        "title": "No Tumor Class",
         "description": [
-            "No abnormal growth detected.",
-            "Brain structure appears normal.",
-            "Simple: Healthy brain scan.",
+            "Model class for scans labeled without tumor in this dataset.",
+            "This prediction does not establish that a scan is normal.",
+            "Professional review is needed regardless of model confidence.",
         ],
     },
 }
@@ -135,12 +137,18 @@ PBKDF2_SALT_BYTES = 16
 CONFIDENCE_HIGH = 0.85
 CONFIDENCE_MEDIUM = 0.70
 
-db_url = os.getenv("DATABASE_URL", "sqlite:///brain_tumor_app.db")
+db_url = os.getenv("DATABASE_URL", f"sqlite:///{ROOT / 'brain_tumor_app.db'}")
 if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 
-connect_args = {"check_same_thread": False} if db_url.startswith("sqlite") else {}
-engine = create_engine(db_url, future=True, pool_pre_ping=True, connect_args=connect_args)
+@st.cache_resource(show_spinner=False)
+def get_database_engine(url: str):
+    connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+    options = {"poolclass": NullPool} if url.startswith("sqlite") and url not in ("sqlite://", "sqlite:///:memory:") else {}
+    return create_engine(url, future=True, pool_pre_ping=True, connect_args=connect_args, **options)
+
+
+engine = get_database_engine(db_url)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -212,13 +220,13 @@ def init_db() -> None:
         with engine.begin() as conn:
             conn.execute(text("ALTER TABLE predictions ADD COLUMN image_path TEXT"))
 
-    admin_email = os.getenv("ADMIN_EMAIL", "admin@brain.local")
-    admin_password = os.getenv("ADMIN_PASSWORD", "admin123")
+    admin_email = os.getenv("ADMIN_EMAIL", "admin@brain.local").strip().lower()
+    admin_password = os.getenv("ADMIN_PASSWORD")
     admin_name = os.getenv("ADMIN_NAME", "System Admin")
 
     with SessionLocal() as db:
         admin = db.query(User).filter(User.email == admin_email).first()
-        if admin is None:
+        if admin is None and admin_password:
             admin = User(
                 email=admin_email,
                 password_hash=hash_password(admin_password),
@@ -362,6 +370,35 @@ def store_uploaded_image(user_id: int, uploaded_file) -> Path:
     return out_path
 
 
+def remove_uploaded_image(image_path: str) -> None:
+    """Delete only files inside the configured uploads directory."""
+    path = Path(image_path).resolve()
+    if not path.is_relative_to(UPLOADS_DIR.resolve()):
+        return
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def remove_user_uploads(user_id: int) -> None:
+    user_dir = UPLOADS_DIR / f"user_{user_id}"
+    if user_dir.exists():
+        for path in user_dir.rglob("*"):
+            if path.is_file():
+                remove_uploaded_image(str(path))
+        for path in sorted(user_dir.rglob("*"), reverse=True):
+            if path.is_dir():
+                try:
+                    path.rmdir()
+                except OSError:
+                    pass
+        try:
+            user_dir.rmdir()
+        except OSError:
+            pass
+
+
 def update_user_credentials(user_id: int, new_email: str | None = None, new_password: str | None = None):
     with SessionLocal() as db:
         user = db.query(User).filter(User.id == user_id).first()
@@ -398,12 +435,7 @@ def delete_prediction_record(prediction_id: int, requester_user_id: int, is_admi
         db.commit()
 
     if img_path:
-        p = Path(img_path)
-        if p.exists():
-            try:
-                p.unlink()
-            except OSError:
-                pass
+        remove_uploaded_image(img_path)
     return True, "Prediction record deleted."
 
 
@@ -416,12 +448,7 @@ def delete_all_user_predictions(user_id: int):
         db.commit()
 
     for p in img_paths:
-        fp = Path(p)
-        if fp.exists():
-            try:
-                fp.unlink()
-            except OSError:
-                pass
+        remove_uploaded_image(p)
     return len(rows)
 
 
@@ -442,6 +469,7 @@ def delete_user_account_by_admin(target_user_id: int, acting_admin_id: int):
         db.delete(user)
         db.commit()
 
+    remove_user_uploads(target_user_id)
     return True, "User account deleted."
 
 
@@ -458,118 +486,15 @@ def delete_user_account_self(user_id: int, password: str):
         db.delete(user)
         db.commit()
 
-    user_dir = UPLOADS_DIR / f"user_{user_id}"
-    if user_dir.exists():
-        for p in user_dir.rglob("*"):
-            if p.is_file():
-                try:
-                    p.unlink()
-                except OSError:
-                    pass
-        try:
-            for sub in sorted(user_dir.rglob("*"), reverse=True):
-                if sub.is_dir():
-                    sub.rmdir()
-            user_dir.rmdir()
-        except OSError:
-            pass
+    remove_user_uploads(user_id)
 
     return True, "Your account was deleted successfully."
 
 
 # ---------- Model definitions ----------
-class BasicCNN(nn.Module):
-    def __init__(self, num_classes: int):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(256 * 14 * 14, 512),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.4),
-            nn.Linear(512, num_classes),
-        )
-
-    def forward(self, x):
-        x = self.features(x)
-        x = self.classifier(x)
-        return x
-
-
-def build_basic_cnn(num_classes: int) -> nn.Module:
-    return BasicCNN(num_classes=num_classes)
-
-
-def build_resnet50_transfer(num_classes: int) -> nn.Module:
-    model = models.resnet50(weights=None)
-    model.fc = nn.Linear(model.fc.in_features, num_classes)
-    return model
-
-
-def build_efficientnet_b0_transfer(num_classes: int) -> nn.Module:
-    model = models.efficientnet_b0(weights=None)
-    model.classifier[1] = nn.Linear(model.classifier[1].in_features, num_classes)
-    return model
-
-
 @st.cache_resource(show_spinner=False)
 def load_artifacts():
-    if not MODEL_PATH.exists():
-        raise FileNotFoundError(f"Model checkpoint not found: {MODEL_PATH}")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(MODEL_PATH, map_location=device)
-
-    model_name = checkpoint["model_name"]
-    idx_to_class = checkpoint.get("idx_to_class", {})
-    idx_to_class = {int(k): str(v) for k, v in idx_to_class.items()}
-
-    if not idx_to_class and CLASS_MAP_PATH.exists():
-        with open(CLASS_MAP_PATH, "r", encoding="utf-8") as f:
-            class_map = json.load(f)
-        from_json = class_map.get("idx_to_class", {})
-        idx_to_class = {int(k): str(v) for k, v in from_json.items()}
-
-    if not idx_to_class:
-        raise ValueError("Could not load class mapping from checkpoint or class_mapping.json")
-
-    num_classes = len(idx_to_class)
-    img_size = int(checkpoint.get("img_size", 224))
-
-    if model_name == "Basic CNN":
-        model = build_basic_cnn(num_classes)
-    elif model_name == "ResNet50":
-        model = build_resnet50_transfer(num_classes)
-    elif model_name == "EfficientNet-B0":
-        model = build_efficientnet_b0_transfer(num_classes)
-    else:
-        raise ValueError(f"Unsupported model_name in checkpoint: {model_name}")
-
-    model.load_state_dict(checkpoint["state_dict"])
-    model.to(device)
-    model.eval()
-
-    infer_transform = transforms.Compose(
-        [
-            transforms.Resize((img_size, img_size)),
-            transforms.ToTensor(),
-        ]
-    )
-
-    return model, device, idx_to_class, infer_transform, model_name
+    return load_inference_artifacts(MODEL_PATH, CLASS_MAP_PATH)
 
 
 def predict_pil_image(pil_img: Image.Image):
@@ -609,18 +534,19 @@ def build_saliency_overlay(pil_img: Image.Image):
     _, _, h, w = x0.shape
     smooth = np.zeros((h, w), dtype=np.float32)
 
+    with torch.no_grad():
+        target_idx = int(model(x0).argmax(dim=1).item())
+
     # SmoothGrad produces more stable and visually meaningful saliency than raw single-pass gradients.
     smooth_samples = 10
     noise_std = 0.10
     for _ in range(smooth_samples):
         noisy = (x0 + noise_std * torch.randn_like(x0)).clamp(0.0, 1.0).detach().clone().requires_grad_(True)
-        model.zero_grad(set_to_none=True)
         logits = model(noisy)
-        pred_idx = int(torch.argmax(logits, dim=1).item())
-        score = logits[0, pred_idx]
-        score.backward()
+        score = logits[0, target_idx]
+        input_grad, = torch.autograd.grad(score, noisy)
 
-        grad = noisy.grad.detach().abs().mean(dim=1).squeeze(0).cpu().numpy()
+        grad = input_grad.detach().abs().mean(dim=1).squeeze(0).cpu().numpy()
         smooth += grad.astype(np.float32)
 
     smooth /= float(smooth_samples)
@@ -637,7 +563,7 @@ def build_saliency_overlay(pil_img: Image.Image):
     heat = np.array(saliency_map, dtype=np.float32) / 255.0
 
     base = np.array(pil_img.convert("RGB"), dtype=np.float32)
-    cmap_rgb = (cm.get_cmap("turbo")(heat)[..., :3] * 255.0).astype(np.float32)
+    cmap_rgb = (matplotlib.colormaps["turbo"](heat)[..., :3] * 255.0).astype(np.float32)
 
     # Stronger adaptive alpha to clearly differentiate overlay from original.
     alpha = (0.15 + 0.75 * np.power(heat, 0.8))[..., None]
@@ -788,7 +714,7 @@ def render_guide_and_examples():
         cols = st.columns(len(samples))
         for i, p in enumerate(samples):
             with cols[i]:
-                show_image_compat(str(p), caption=p.name, use_container_width=True)
+                show_image_compat(str(p), caption=p.name, width="stretch")
 
 
 def render_login_signup():
@@ -809,7 +735,7 @@ def render_login_signup():
         with st.form("login_form"):
             email = st.text_input("Email")
             password = st.text_input("Password", type="password")
-            submit_login = st.form_submit_button("Login", use_container_width=True)
+            submit_login = st.form_submit_button("Login", width="stretch")
 
         if submit_login:
             user = authenticate_user(email, password)
@@ -831,7 +757,7 @@ def render_login_signup():
             age = st.number_input("Age (optional)", min_value=0, max_value=120, value=0, step=1)
             password = st.text_input("Password", type="password", key="signup_pwd")
             confirm_password = st.text_input("Confirm Password", type="password")
-            submit_signup = st.form_submit_button("Create Account", use_container_width=True)
+            submit_signup = st.form_submit_button("Create Account", width="stretch")
 
         if submit_signup:
             if not full_name.strip() or not email.strip() or not password:
@@ -866,23 +792,28 @@ def render_user_prediction_page(current_user: User):
         uploaded_file = st.file_uploader(
             "Choose an image",
             type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            max_upload_size=32,
             key="user_uploader",
         )
         show_heatmap = st.checkbox("Show visual explanation (heatmap)", value=True, key="single_heatmap")
-        run_pred = st.button("Predict", type="primary", use_container_width=True)
+        run_pred = st.button("Predict", type="primary", width="stretch")
         if uploaded_file is not None:
-            preview = Image.open(uploaded_file).convert("RGB")
-            show_image_compat(preview, caption="Uploaded MRI", use_container_width=True)
+            try:
+                preview = decode_image(uploaded_file)
+                show_image_compat(preview, caption="Uploaded MRI", width="stretch")
+            except ValueError as exc:
+                st.error(str(exc))
 
     with right:
         st.subheader("Prediction Output")
+        st.caption("Confidence is an uncalibrated model score, not measured accuracy or diagnostic certainty.")
         if run_pred:
             if uploaded_file is None:
                 st.warning("Please upload an image first.")
             else:
                 try:
                     uploaded_bytes = uploaded_file.getvalue()
-                    pil = Image.open(BytesIO(uploaded_bytes)).convert("RGB")
+                    pil = decode_image(uploaded_bytes)
                     pred_label, pred_conf, prob_df = predict_pil_image(pil)
 
                     conf_pct = pred_conf * 100.0
@@ -903,11 +834,11 @@ def render_user_prediction_page(current_user: User):
                             overlay_img, heat_img = build_saliency_overlay(pil)
                             h1, h2, h3 = st.columns(3)
                             with h1:
-                                show_image_compat(pil, caption="Original MRI", use_container_width=True)
+                                show_image_compat(pil, caption="Original MRI", width="stretch")
                             with h2:
-                                show_image_compat(overlay_img, caption="Overlay explanation", use_container_width=True)
+                                show_image_compat(overlay_img, caption="Overlay explanation", width="stretch")
                             with h3:
-                                show_image_compat(heat_img, caption="Saliency heatmap", use_container_width=True)
+                                show_image_compat(heat_img, caption="Saliency heatmap", width="stretch")
                         except Exception as hm_err:
                             st.info(f"Heatmap unavailable for this model output: {hm_err}")
 
@@ -931,11 +862,12 @@ def render_user_prediction_page(current_user: User):
     batch_files = st.file_uploader(
         "Choose multiple images",
         type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            max_upload_size=32,
         accept_multiple_files=True,
         key="batch_uploader",
     )
     batch_heatmap = st.checkbox("Enable visual explanation selector for batch results", value=False, key="batch_heatmap")
-    run_batch = st.button("Run Batch Prediction", type="primary", use_container_width=True, key="run_batch_btn")
+    run_batch = st.button("Run Batch Prediction", type="primary", width="stretch", key="run_batch_btn")
 
     if run_batch:
         if not batch_files:
@@ -950,7 +882,7 @@ def render_user_prediction_page(current_user: User):
                 row_key = f"{idx:03d}_{sanitize_filename(bf.name)}"
                 try:
                     file_bytes = bf.getvalue()
-                    pil = Image.open(BytesIO(file_bytes)).convert("RGB")
+                    pil = decode_image(file_bytes)
                     pred_label, pred_conf, prob_df = predict_pil_image(pil)
 
                     level, level_text = confidence_alert_level(pred_conf)
@@ -999,18 +931,20 @@ def render_user_prediction_page(current_user: User):
                 st.error(f"Low confidence alerts: {low_conf_count} case(s).")
             elif medium_conf_count > 0:
                 st.warning(f"Moderate confidence alerts: {medium_conf_count} case(s).")
+            elif any(r["status"].startswith("failed:") for r in batch_rows):
+                st.warning("Batch finished with failed files. Check each row's status.")
             else:
                 st.success("Batch completed with high-confidence results.")
 
     if st.session_state.batch_results:
         batch_df = pd.DataFrame(st.session_state.batch_results)
-        dataframe_compat(batch_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(batch_df, width="stretch", height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download Batch Results CSV",
             data=batch_df.to_csv(index=False).encode("utf-8"),
             file_name="batch_prediction_results.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
         if batch_heatmap:
@@ -1024,15 +958,15 @@ def render_user_prediction_page(current_user: User):
                 img_bytes = st.session_state.batch_image_bytes.get(selected_key)
                 if img_bytes:
                     try:
-                        sel_img = Image.open(BytesIO(img_bytes)).convert("RGB")
+                        sel_img = decode_image(img_bytes)
                         overlay_img, heat_img = build_saliency_overlay(sel_img)
                         c1, c2, c3 = st.columns(3)
                         with c1:
-                            show_image_compat(sel_img, caption=f"Original ({selected_key})", use_container_width=True)
+                            show_image_compat(sel_img, caption=f"Original ({selected_key})", width="stretch")
                         with c2:
-                            show_image_compat(overlay_img, caption="Overlay explanation", use_container_width=True)
+                            show_image_compat(overlay_img, caption="Overlay explanation", width="stretch")
                         with c3:
-                            show_image_compat(heat_img, caption="Saliency heatmap", use_container_width=True)
+                            show_image_compat(heat_img, caption="Saliency heatmap", width="stretch")
                     except Exception as hm_err:
                         st.info(f"Batch heatmap unavailable: {hm_err}")
 
@@ -1051,13 +985,13 @@ def render_user_prediction_page(current_user: User):
             for r in db_rows
         ]
         db_df = pd.DataFrame(db_data)
-        dataframe_compat(db_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(db_df, width="stretch", height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download History CSV",
             data=db_df.to_csv(index=False).encode("utf-8"),
             file_name="prediction_history.csv",
             mime="text/csv",
-            use_container_width=True,
+            width="stretch",
         )
 
         st.markdown("### Delete Records")
@@ -1067,7 +1001,7 @@ def render_user_prediction_page(current_user: User):
             delete_df,
             hide_index=True,
             height=TABLE_HEIGHT_7_ROWS,
-            use_container_width=True,
+            width="stretch",
             key="user_delete_editor",
             column_config={
                 "delete": st.column_config.CheckboxColumn("Delete"),
@@ -1078,7 +1012,7 @@ def render_user_prediction_page(current_user: User):
 
         col_a, col_b = st.columns(2)
         with col_a:
-            if st.button("Delete Selected", use_container_width=True, type="secondary"):
+            if st.button("Delete Selected", width="stretch", type="secondary"):
                 ids = edited_user_df.loc[edited_user_df["delete"] == True, "id"].astype(int).tolist()
                 if not ids:
                     st.info("Select at least one row using the Delete checkbox.")
@@ -1095,7 +1029,7 @@ def render_user_prediction_page(current_user: User):
                     st.success(f"Deleted {deleted_count} record(s).")
                     rerun_app()
         with col_b:
-            if st.button("Delete All My History", use_container_width=True):
+            if st.button("Delete All My History", width="stretch"):
                 deleted = delete_all_user_predictions(current_user.id)
                 st.success(f"Deleted {deleted} records.")
                 rerun_app()
@@ -1193,7 +1127,7 @@ def render_admin_page(current_admin: User):
                 }
             )
         activity_df = pd.DataFrame(activity_rows).sort_values("times_used", ascending=False)
-        dataframe_compat(activity_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(activity_df, width="stretch", height=TABLE_HEIGHT_7_ROWS)
     else:
         st.info("No activity yet.")
 
@@ -1214,7 +1148,7 @@ def render_admin_page(current_admin: User):
                 for u in users
             ]
         )
-        dataframe_compat(users_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(users_df, width="stretch", height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="Download Users CSV",
             data=users_df.to_csv(index=False).encode("utf-8"),
@@ -1234,7 +1168,7 @@ def render_admin_page(current_admin: User):
 
             c1, c2 = st.columns(2)
             with c1:
-                if st.button("Update User Credentials", use_container_width=True):
+                if st.button("Update User Credentials", width="stretch"):
                     ok, msg = update_user_credentials(
                         user_id=selected_user.id,
                         new_email=new_email.strip() if new_email.strip() else None,
@@ -1246,7 +1180,7 @@ def render_admin_page(current_admin: User):
                     else:
                         st.error(msg)
             with c2:
-                if st.button("Delete User Account", use_container_width=True):
+                if st.button("Delete User Account", width="stretch"):
                     ok, msg = delete_user_account_by_admin(
                         target_user_id=selected_user.id,
                         acting_admin_id=current_admin.id,
@@ -1260,7 +1194,7 @@ def render_admin_page(current_admin: User):
         st.markdown("### Admin Account Settings")
         admin_new_email = st.text_input("Change my admin email", value=current_admin.email, key="admin_self_email")
         admin_new_password = st.text_input("Change my admin password (optional)", type="password", key="admin_self_pwd")
-        if st.button("Update My Admin Account", use_container_width=True):
+        if st.button("Update My Admin Account", width="stretch"):
             ok, msg = update_user_credentials(
                 user_id=current_admin.id,
                 new_email=admin_new_email.strip() if admin_new_email.strip() else None,
@@ -1350,28 +1284,29 @@ def render_admin_page(current_admin: User):
         with filter_col_reset:
             st.write("")
             st.write("")
-            if st.button("🔄 Reset Filters", use_container_width=True):
-                st.session_state.filter_class = ["glioma", "meningioma", "pituitary", "notumor"]
-                st.session_state.filter_conf = (0.0, 1.0)
-                st.session_state.filter_email_search = ""
-                st.session_state.filter_patient_name = ""
-                st.session_state.filter_patient_id = ""
-                rerun_app()
+            def reset_admin_filters():
+                for key in ("filter_class", "filter_conf", "filter_email_search", "filter_patient_name", "filter_patient_id", "filter_date"):
+                    st.session_state.pop(key, None)
+            st.button("🔄 Reset Filters", width="stretch", on_click=reset_admin_filters)
         
+        if len(date_range) != 2:
+            st.info("Select both the start and end dates to filter records.")
+            return
+
         # Apply filters
         filtered_df = pred_df[
             (pred_df["predicted_class"].isin(selected_class)) &
             (pred_df["confidence"] >= min_conf) &
             (pred_df["confidence"] <= max_conf) &
-            (pred_df["user_email"].str.contains(email_search, case=False, na=False) if email_search else True) &
-            (pred_df["patient_name"].str.contains(patient_name_search, case=False, na=False) if patient_name_search else True) &
-            (pred_df["patient_id"].astype(str).str.contains(patient_id_search, case=False, na=False) if patient_id_search else True) &
+            (pred_df["user_email"].str.contains(email_search, case=False, na=False, regex=False) if email_search else True) &
+            (pred_df["patient_name"].str.contains(patient_name_search, case=False, na=False, regex=False) if patient_name_search else True) &
+            (pred_df["patient_id"].astype(str).str.contains(patient_id_search, case=False, na=False, regex=False) if patient_id_search else True) &
             (pd.to_datetime(pred_df["created_at"]).dt.date >= date_range[0]) &
             (pd.to_datetime(pred_df["created_at"]).dt.date <= date_range[1])
         ]
         
         st.markdown(f"**Showing {len(filtered_df)} of {len(pred_df)} records**")
-        dataframe_compat(filtered_df, use_container_width=True, height=TABLE_HEIGHT_7_ROWS)
+        dataframe_compat(filtered_df, width="stretch", height=TABLE_HEIGHT_7_ROWS)
         st.download_button(
             label="📥 Download Filtered CSV",
             data=filtered_df.to_csv(index=False).encode("utf-8"),
@@ -1386,7 +1321,7 @@ def render_admin_page(current_admin: User):
             admin_delete_df,
             hide_index=True,
             height=TABLE_HEIGHT_7_ROWS,
-            use_container_width=True,
+            width="stretch",
             key="admin_delete_editor",
             column_config={
                 "delete": st.column_config.CheckboxColumn("Delete"),
@@ -1395,7 +1330,7 @@ def render_admin_page(current_admin: User):
             },
             disabled=["id", "patient_id", "patient_name", "user_email", "image_name", "predicted_class", "confidence", "created_at"],
         )
-        if st.button("Delete Selected Prediction(s)", use_container_width=True):
+        if st.button("Delete Selected Prediction(s)", width="stretch"):
             ids = edited_admin_df.loc[edited_admin_df["delete"] == True, "id"].astype(int).tolist()
             if not ids:
                 st.info("Select at least one row using the Delete checkbox.")
@@ -1445,7 +1380,7 @@ def render_admin_page(current_admin: User):
                     data=all_images_zip.getvalue(),
                     file_name="all_brain_tumor_images.zip",
                     mime="application/zip",
-                    use_container_width=True,
+                    width="stretch",
                     key="btn_download_all_active"
                 )
             
@@ -1471,7 +1406,7 @@ def render_admin_page(current_admin: User):
                                     data=f.read(),
                                     file_name=Path(resolved_path).name,
                                     mime="image/jpeg",
-                                    use_container_width=True,
+                                    width="stretch",
                                     key=f"single_download_{selected_pred.id}"
                                 )
                     else:
@@ -1514,6 +1449,8 @@ def render_segmentation_page(current_user: User):
         _seg_unavailable_warning()
         return
 
+    st.caption("Experimental intensity-based segmentation. Highlighted regions are candidate regions, not confirmed tumors; sizes are pixels at 256 x 256 resolution.")
+
     # ── Method Architecture Summary ──────────────────────────────────────────
     st.markdown(
         """
@@ -1538,17 +1475,22 @@ def render_segmentation_page(current_user: User):
         seg_file = st.file_uploader(
             "Choose a Brain MRI Scan",
             type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            max_upload_size=32,
             key="seg_uploader",
         )
         gt_file = st.file_uploader(
             "Ground Truth Mask (optional — for quantitative evaluation)",
             type=["jpg", "jpeg", "png", "bmp", "tif", "tiff", "webp"],
+            max_upload_size=32,
             key="seg_gt_uploader",
             help="Upload a ground-truth tumor mask if available to calculate Dice & IoU metrics.",
         )
         if seg_file is not None:
-            preview = Image.open(seg_file).convert("RGB")
-            show_image_compat(preview, caption="Uploaded MRI Scan", use_container_width=True)
+            try:
+                preview = decode_image(seg_file)
+                show_image_compat(preview, caption="Uploaded MRI Scan", width="stretch")
+            except ValueError as exc:
+                st.error(str(exc))
 
     with options_col:
         st.subheader("⚙️ Graph Cut Controls")
@@ -1575,8 +1517,8 @@ def render_segmentation_page(current_user: User):
             "🎯 Anatomical Region Targeting",
             [
                 "Auto-Detect (Whole Brain)",
-                "Right Hemisphere Focus",
-                "Left Hemisphere Focus",
+                "Right Side of Image",
+                "Left Side of Image",
                 "Center / Pituitary Region",
             ],
             index=0,
@@ -1585,8 +1527,8 @@ def render_segmentation_page(current_user: User):
         )
         region_map = {
             "Auto-Detect (Whole Brain)": "auto",
-            "Right Hemisphere Focus": "right_hemisphere",
-            "Left Hemisphere Focus": "left_hemisphere",
+            "Right Side of Image": "right_hemisphere",
+            "Left Side of Image": "left_hemisphere",
             "Center / Pituitary Region": "center_pituitary",
         }
         region_filter = region_map[region_label]
@@ -1610,7 +1552,7 @@ def render_segmentation_page(current_user: User):
 
         gc_postprocess = st.checkbox("Morphological Cleanup & Boundary Smoothing", value=True, key="gc_postprocess")
 
-        run_btn = st.button("✂️ Run Graph Cut Segmentation", type="primary", use_container_width=True, key="seg_run_btn")
+        run_btn = st.button("✂️ Run Graph Cut Segmentation", type="primary", width="stretch", key="seg_run_btn")
 
     # ── Execution & Results ───────────────────────────────────────────────────
     if run_btn:
@@ -1619,13 +1561,19 @@ def render_segmentation_page(current_user: User):
             return
 
         mri_bytes = seg_file.getvalue()
-        pil_img = Image.open(BytesIO(mri_bytes)).convert("RGB")
         gt_mask_np = None
-
-        if gt_file is not None:
-            gt_pil = Image.open(gt_file.getvalue() if hasattr(gt_file, "getvalue") else gt_file).convert("L")
-            gt_arr = np.array(gt_pil.resize((256, 256), Image.NEAREST), dtype=np.float32)
-            gt_mask_np = (gt_arr > 127).astype(np.uint8)
+        try:
+            pil_img = decode_image(mri_bytes)
+            if gt_file is not None:
+                gt_pil = decode_image(gt_file, mode="L")
+                if gt_pil.size != pil_img.size:
+                    raise ValueError("Ground-truth mask must have the same dimensions as the MRI image.")
+                gt_arr = np.array(gt_pil.resize((256, 256), Image.Resampling.NEAREST))
+                # Accept both {0,1} and {0,255} binary masks.
+                gt_mask_np = (gt_arr > (0 if gt_arr.max() <= 1 else 127)).astype(np.uint8)
+        except ValueError as exc:
+            st.error(str(exc))
+            return
 
         with st.spinner("⚡ Running Graph Cut segmentation & boundary isolation…"):
             try:
@@ -1659,27 +1607,28 @@ def render_segmentation_page(current_user: User):
         display_cols = st.columns(num_cards)
 
         with display_cols[0]:
-            show_image_compat(pil_img, caption="1. Input MRI Scan", use_container_width=True)
+            show_image_compat(pil_img, caption="1. Input MRI Scan", width="stretch")
 
         with display_cols[1]:
-            show_image_compat(gc_result["contour_pil"], caption="2. Cyan Boundary Outline", use_container_width=True)
+            show_image_compat(gc_result["contour_pil"], caption="2. Cyan Boundary Outline", width="stretch")
 
         with display_cols[2]:
-            show_image_compat(gc_result["overlay"], caption="3. Red Tissue Highlight", use_container_width=True)
+            show_image_compat(gc_result["overlay"], caption="3. Red Tissue Highlight", width="stretch")
 
         with display_cols[3]:
-            show_image_compat(gc_result["mask_pil"], caption="4. Binary Tumor Mask", use_container_width=True)
+            show_image_compat(gc_result["mask_pil"], caption="4. Binary Tumor Mask", width="stretch")
 
         if has_roi:
             with display_cols[4]:
-                show_image_compat(gc_result["roi_pil"], caption="5. Magnified Tumor ROI", use_container_width=True)
+                show_image_compat(gc_result["roi_pil"], caption="5. Magnified Tumor ROI", width="stretch")
 
         # ── Quantitative Tumor Measurements ───────────────────────────────────
         st.markdown("---")
         st.subheader("📐 Quantitative Tumor Measurements")
 
         m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("🔴 Tumor Area", f"{gc_result['tumor_pixels']:,} px")
+        st.caption(f"Method executed: {gc_result['method']}")
+        m1.metric("🔴 Candidate Area", f"{gc_result['tumor_pixels']:,} px")
         m2.metric("🔬 Scan Coverage", f"{gc_result['tumor_pct']:.2f}%")
         m3.metric("🧠 Brain Burden", f"{gc_result['brain_pct']:.2f}%")
         m4.metric("📏 Est. Diameter", f"{gc_result['diameter_px']:.1f} px")
@@ -1690,14 +1639,14 @@ def render_segmentation_page(current_user: User):
             st.markdown("---")
             st.subheader("📊 Accuracy Evaluation (vs Ground Truth)")
             metrics_df = pd.DataFrame([gc_metrics.summary()])
-            dataframe_compat(metrics_df, use_container_width=True)
+            dataframe_compat(metrics_df, width="stretch")
 
             st.download_button(
                 label="📥 Download Evaluation Metrics CSV",
                 data=metrics_df.to_csv(index=False).encode("utf-8"),
                 file_name="graph_cut_metrics.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width="stretch",
             )
 
         # ── Download Segmented Mask ───────────────────────────────────────────
@@ -1708,7 +1657,7 @@ def render_segmentation_page(current_user: User):
             data=buf.getvalue(),
             file_name="segmented_tumor_mask.png",
             mime="image/png",
-            use_container_width=True,
+            width="stretch",
         )
 
         # ── Method Documentation Expander ─────────────────────────────────────
@@ -1776,7 +1725,7 @@ def main():
             st.markdown("---")
             st.write(f"Logged in as: {current_user.email}")
             st.write(f"Role: {current_user.role}")
-            if st.button("Logout", use_container_width=True):
+            if st.button("Logout", width="stretch"):
                 logout()
 
             if current_user.role == "user":
@@ -1784,7 +1733,7 @@ def main():
                     st.caption("Delete your account permanently. This removes your prediction history and cannot be undone.")
                     confirm_delete = st.checkbox("I understand this action is permanent.", key="confirm_delete_account")
                     delete_pwd = st.text_input("Confirm password", type="password", key="delete_account_password")
-                    if st.button("Delete My Account", use_container_width=True, type="secondary"):
+                    if st.button("Delete My Account", width="stretch", type="secondary"):
                         if not confirm_delete:
                             st.warning("Please confirm that you understand this action is permanent.")
                         elif not delete_pwd:

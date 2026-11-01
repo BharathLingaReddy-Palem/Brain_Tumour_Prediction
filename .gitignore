@@ -11,7 +11,6 @@ brain_tumor_app.db
 uploaded_scans/
 debug_*.png
 test_*.png
-test_*.py
 
 # Environments & IDE
 .vscode/
@@ -19,3 +18,15 @@ test_*.py
 .venv/
 env/
 venv/
+
+# Reproducible test code is tracked; downloaded scans and local audit state stay local.
+webtesting_folder/images/
+artifacts/audit/browser_uploads/
+artifacts/audit/*.py
+
+# Local audit state, source-document extracts and credentials never belong in deployment commits.
+artifacts/audit/
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example

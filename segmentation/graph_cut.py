@@ -131,6 +131,8 @@ def _run_normalized_cut(
     """
     if not _SKIMAGE_OK or skgraph is None:
         raise RuntimeError("scikit-image graph module is required for Normalized Cut.")
+    if not np.any(brain_mask) or np.std(gray[brain_mask]) < 1.0:
+        return np.zeros_like(gray, dtype=np.uint8)
 
     clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
     enhanced_gray = clahe.apply(gray)
@@ -155,7 +157,7 @@ def _run_normalized_cut(
         in_place=False,
     )
 
-    unique_labels = [l for l in np.unique(labels_cut) if l > 0]
+    unique_labels = np.unique(labels_cut[brain_mask]).tolist()
     if not unique_labels:
         return np.zeros_like(gray, dtype=np.uint8)
 
@@ -185,7 +187,9 @@ def _run_normalized_cut(
     else:
         # Fallback: top intensity superpixels
         superpixel_means = []
-        for l in unique_labels:
+        for l in np.unique(segments):
+            if l == 0:
+                continue
             seg_region = (segments == l) & brain_mask
             if np.sum(seg_region) > 20:
                 superpixel_means.append((l, float(np.mean(gray[seg_region]))))
@@ -351,10 +355,8 @@ def _generate_visualizations(
     overlay_arr[tumor_bool] = (1 - alpha) * overlay_arr[tumor_bool] + alpha * red_tint
     overlay_pil = Image.fromarray(np.clip(overlay_arr, 0, 255).astype(np.uint8))
 
-    # 2. Binary Mask (clinical red)
-    mask_rgb = np.zeros((mask.shape[0], mask.shape[1], 3), dtype=np.uint8)
-    mask_rgb[tumor_bool] = [240, 50, 50]
-    mask_pil = Image.fromarray(mask_rgb)
+    # Export actual binary grayscale so masks round-trip through thresholding.
+    mask_pil = Image.fromarray(tumor_bool.astype(np.uint8) * 255)
 
     # 3. Contour outline overlay (crisp cyan boundary)
     contour_arr = base_rgb.copy()
@@ -415,6 +417,12 @@ class GraphCutSegmenter:
     ):
         if method not in ("normalized_cut", "grabcut", "both"):
             raise ValueError(f"Unknown method '{method}'. Use 'normalized_cut', 'grabcut', or 'both'.")
+        if img_size < 32:
+            raise ValueError("img_size must be at least 32 pixels.")
+        if not np.isfinite(sensitivity) or not 0.5 <= sensitivity <= 2.0:
+            raise ValueError("sensitivity must be between 0.5 and 2.0.")
+        if region_filter not in ("auto", "right_hemisphere", "left_hemisphere", "center_pituitary"):
+            raise ValueError(f"Unknown region_filter: {region_filter}")
 
         if method in ("normalized_cut", "both") and (not _SKIMAGE_OK or skgraph is None):
             warnings.warn("skimage.graph is not available; falling back to 'grabcut'.", stacklevel=2)
@@ -437,12 +445,14 @@ class GraphCutSegmenter:
 
         ncut_mask = None
         mincut_mask = None
+        actual_method = self.method
 
         if self.method in ("normalized_cut", "both"):
             try:
                 ncut_mask = _run_normalized_cut(rgb, gray, brain_mask, self.sensitivity)
             except Exception as e:
                 warnings.warn(f"Normalized Cut error: {e}. Falling back to Min-Cut.", stacklevel=2)
+                actual_method = "grabcut"
 
         if self.method in ("grabcut", "both") or ncut_mask is None:
             mincut_mask = _run_min_cut(rgb, gray, brain_mask, self.sensitivity)
@@ -490,7 +500,7 @@ class GraphCutSegmenter:
             "overlay": overlay_pil,
             "mask_pil": mask_pil,
             "roi_pil": roi_pil,
-            "method": self.method,
+            "method": actual_method,
             "img_size": self.img_size,
             "tumor_pixels": tumor_px,
             "tumor_pct": float((tumor_px / total_px) * 100.0),

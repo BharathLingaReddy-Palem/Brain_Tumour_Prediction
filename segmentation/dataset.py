@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import os
 import random
+from copy import copy
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
@@ -69,7 +70,7 @@ def _random_rotate90(img: np.ndarray, mask: np.ndarray, p: float = 0.3):
 
 def _random_brightness(img: np.ndarray, max_delta: float = 0.15):
     delta = random.uniform(-max_delta, max_delta)
-    return np.clip(img + delta, 0.0, 1.0)
+    return np.clip(img + delta, -1.0, 1.0)
 
 
 def apply_augmentations(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -87,7 +88,7 @@ def apply_augmentations(img: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, 
 
 def preprocess_image(pil_img: Image.Image, size: int) -> np.ndarray:
     """
-    Convert PIL image → float32 numpy array [0,1], shape (H, W).
+    Convert PIL image → float32 numpy array [-1,1], shape (H, W).
     Grayscale — suitable for U-Net input (1 channel).
     """
     img = pil_img.convert("L").resize((size, size), Image.LANCZOS)
@@ -103,7 +104,7 @@ def preprocess_mask(pil_mask: Image.Image, size: int) -> np.ndarray:
     """
     mask = pil_mask.convert("L").resize((size, size), Image.NEAREST)
     arr  = np.array(mask, dtype=np.float32)
-    arr  = (arr > 127).astype(np.float32)   # binarise
+    arr  = (arr > (0 if arr.max() <= 1 else 127)).astype(np.float32)
     return arr
 
 
@@ -209,11 +210,13 @@ class PairedFolderDataset(Dataset):
         masks_dir: str | Path,
         img_size: int = 256,
         augment: bool = False,
+        allow_missing_masks: bool = False,
     ):
         self.images_dir = Path(images_dir)
         self.masks_dir  = Path(masks_dir)
         self.img_size   = img_size
         self.augment    = augment
+        self.allow_missing_masks = allow_missing_masks
 
         self.image_files = sorted(
             p for p in self.images_dir.iterdir()
@@ -222,6 +225,13 @@ class PairedFolderDataset(Dataset):
 
         if not self.image_files:
             raise FileNotFoundError(f"No images found in {self.images_dir}")
+        mask_candidates = sorted(self.masks_dir.iterdir()) if self.masks_dir.is_dir() else []
+        self.mask_files = {p.stem: p for p in mask_candidates
+                           if p.is_file() and p.suffix.lower() in self.ALLOWED}
+        missing = [p.name for p in self.image_files if p.stem not in self.mask_files]
+        if missing and not allow_missing_masks:
+            raise FileNotFoundError(f"Missing ground-truth masks for {len(missing)} image(s), including {missing[0]}. "
+                                    "Use allow_missing_masks=True only for inference.")
 
     def __len__(self) -> int:
         return len(self.image_files)
@@ -229,12 +239,7 @@ class PairedFolderDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         img_path = self.image_files[idx]
         # Try to find matching mask (same stem, any supported extension)
-        mask_path = None
-        for ext in self.ALLOWED:
-            candidate = self.masks_dir / (img_path.stem + ext)
-            if candidate.exists():
-                mask_path = candidate
-                break
+        mask_path = self.mask_files.get(img_path.stem)
 
         img_arr = preprocess_image(Image.open(img_path), self.img_size)
 
@@ -288,6 +293,8 @@ def get_dataloaders(
     train_loader, val_loader, test_loader
     """
     root = Path(root)
+    if not (0 <= val_split < 1 and 0 <= test_split < 1 and val_split + test_split < 1):
+        raise ValueError("Validation and test fractions must be nonnegative and sum to less than one.")
 
     if fmt == "lgg":
         full_ds = LGGDataset(root, img_size=img_size, augment=False)
@@ -309,9 +316,9 @@ def get_dataloaders(
     gen = torch.Generator().manual_seed(seed)
     train_ds, val_ds, test_ds = random_split(full_ds, [n_train, n_val, n_test], generator=gen)
 
-    # Enable augmentations on train split only
-    if hasattr(train_ds.dataset, "augment"):
-        train_ds.dataset.augment = True
+    # Subsets from random_split share one dataset; copy before changing its transform.
+    train_ds.dataset = copy(full_ds)
+    train_ds.dataset.augment = True
 
     _kwargs = dict(
         batch_size=batch_size,
@@ -343,8 +350,9 @@ if __name__ == "__main__":
     # Test PairedFolderDataset on classification images (no masks)
     ds = PairedFolderDataset(
         images_dir="Dataset/Testing/glioma",
-        masks_dir="Dataset/Testing/glioma",   # No mask dir – zeros returned
+        masks_dir="assets/examples",  # No masks: explicitly opt in for inference.
         img_size=256,
+        allow_missing_masks=True,
     )
     img, mask = ds[0]
     print(f"Image tensor : {img.shape}  range [{img.min():.2f}, {img.max():.2f}]")
